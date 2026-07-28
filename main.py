@@ -12,13 +12,15 @@ app = Flask(__name__)
 TELEGRAM_TOKEN = "8711875284:AAGGERDv9njI0QZ9Fnrc1_tN9xeVLEXtnCc"
 CHAT_ID = "-1004394911035"
 
-# ⏱️ قم بتعديل هذا الرقم لضبط فارق التوقيت (إذا كان الوقت متأخراً، ارفع الرقم من 3 إلى 4 أو حسب الحاجة)
 HOURS_OFFSET = 3
+
+# لتخزين وقت آخر تنبيه تم إرساله لكل عملة وفريم لتجنب التكرار والإرسال العشوائي
+sent_alerts = {}
 
 def get_binance_futures_symbols():
     url = "https://fapi.binance.com/fapi/v1/exchangeInfo"
     try:
-        response = requests.get(url, timeout=10)
+        response = requests.get(url, timeout=5)
         data = response.json()
         symbols = [s['symbol'] for s in data['symbols'] if s['contractType'] == 'PERPETUAL' and s['status'] == 'TRADING']
         return symbols
@@ -26,10 +28,10 @@ def get_binance_futures_symbols():
         print(f"Error fetching symbols: {e}")
     return []
 
-def get_historical_klines(symbol, interval, limit=100):
+def get_historical_klines(symbol, interval, limit=50):
     url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}"
     try:
-        response = requests.get(url, timeout=10)
+        response = requests.get(url, timeout=5)
         data = response.json()
         if isinstance(data, list):
             df = pd.DataFrame(data, columns=[
@@ -41,7 +43,6 @@ def get_historical_klines(symbol, interval, limit=100):
             df['high'] = df['high'].astype(float)
             df['low'] = df['low'].astype(float)
             df['open'] = df['open'].astype(float)
-            # احتساب وقت الشمعة بدقة مع إضافة فارق الساعات المخصص
             df['candle_time'] = pd.to_datetime(df['timestamp'], unit='ms') + timedelta(hours=HOURS_OFFSET)
             return df
     except Exception as e:
@@ -77,6 +78,18 @@ def calculate_rsi_and_divergence(df, period=14):
     return hidden_bull, hidden_bear
 
 def send_telegram_alert(symbol, interval_str, div_type, price, candle_time):
+    alert_key = f"{symbol}_{interval_str}_{candle_time}"
+    
+    # التأكد من عدم إرسال نفس التنبيه لنفس الشمعة مرتين نهائياً
+    if alert_key in sent_alerts:
+        return
+    
+    sent_alerts[alert_key] = True
+    
+    # تنظيف الذاكرة القديمة للحفاظ على أداء السيرفر
+    if len(sent_alerts) > 2000:
+        sent_alerts.clear()
+
     formatted_time = candle_time.strftime('%Y-%m-%d %H:%M:%S')
 
     text = f"""🚨 تنبيه دايفرجنس جديد
@@ -90,7 +103,7 @@ def send_telegram_alert(symbol, interval_str, div_type, price, candle_time):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": text}
     try:
-        requests.post(url, json=payload, timeout=5)
+        requests.post(url, json=payload, timeout=3)
     except Exception as e:
         print(f"Telegram error: {e}")
 
@@ -100,9 +113,10 @@ def scan_market():
     
     for symbol in symbols:
         for binance_tf, label_tf in intervals.items():
-            df = get_historical_klines(symbol, binance_tf, limit=50)
+            df = get_historical_klines(symbol, binance_tf, limit=40)
             if df is not None and not df.empty:
                 h_bull, h_bear = calculate_rsi_and_divergence(df)
+                # فحص الشمعة المغلقة بدقة (الإصدار السابق)
                 current_price = df['close'].iloc[-2]
                 candle_time = df['candle_time'].iloc[-2]
                 
@@ -110,16 +124,16 @@ def scan_market():
                     send_telegram_alert(symbol, label_tf, "Hidden Bullish Divergence", current_price, candle_time)
                 if h_bear:
                     send_telegram_alert(symbol, label_tf, "Hidden Bearish Divergence", current_price, candle_time)
-            time.sleep(0.1)
 
 @app.route("/")
 def home():
-    return "Bot is running perfectly!"
+    return "Bot is running with precise candle timing!"
 
 if __name__ == "__main__":
     scheduler = BackgroundScheduler()
-    scheduler.add_job(func=scan_market, trigger="interval", minutes=2)
+    # فحص دقيق كل دقيقة لتغطية إغلاق فريم 15 دقيقة والساعة في وقتها المحدد
+    scheduler.add_job(func=scan_market, trigger="interval", minutes=1)
     scheduler.start()
     
-    port = int(os.environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
