@@ -14,8 +14,8 @@ CHAT_ID = "-1004394911035"
 
 HOURS_OFFSET = 3
 
-# قاموس لتسجيل التنبيهات المرسلة سابقاً لمنع التكرار نهائياً
-sent_alerts = set()
+# قاموس لتتبع آخر حالة دايفرجنس تم إرسال تنبيه لها لكل عملة وفريم (لمنع الإرسال الجماعي والتكرار)
+last_alerted_status = {}
 
 def get_binance_futures_symbols():
     url = "https://fapi.binance.com/fapi/v1/exchangeInfo"
@@ -43,7 +43,6 @@ def get_historical_klines(symbol, interval, limit=50):
             df['high'] = df['high'].astype(float)
             df['low'] = df['low'].astype(float)
             df['open'] = df['open'].astype(float)
-            # ضبط توقيت الشمعة بدقة مع فارق الساعات المخصص
             df['candle_time'] = pd.to_datetime(df['timestamp'], unit='ms') + timedelta(hours=HOURS_OFFSET)
             return df
     except Exception as e:
@@ -58,7 +57,7 @@ def calculate_rsi_and_divergence(df, period=14):
     df['rsi'] = 100 - (100 / (1 + rs))
     
     if len(df) < 30:
-        return None, None
+        return False, False
         
     lows = df['low'].values
     highs = df['high'].values
@@ -79,18 +78,6 @@ def calculate_rsi_and_divergence(df, period=14):
     return hidden_bull, hidden_bear
 
 def send_telegram_alert(symbol, interval_str, div_type, price, candle_time):
-    # إنشاء مفتاح فريد لا يتكرر أبداً لهذه الشمعة بالذات
-    alert_key = f"{symbol}_{interval_str}_{candle_time}"
-    
-    if alert_key in sent_alerts:
-        return  # تم إرسال تنبيه لهذه الشمعة مسبقاً، تجاهل تام لمنع التكرار
-    
-    sent_alerts.add(alert_key)
-    
-    # تنظيف الذاكرة للحفاظ على خفة السيرفر إذا كثرت المفاتيح
-    if len(sent_alerts) > 3000:
-        sent_alerts.clear()
-
     formatted_time = candle_time.strftime('%Y-%m-%d %H:%M:%S')
 
     text = f"""🚨 تنبيه دايفرجنس جديد
@@ -121,22 +108,30 @@ def scan_market():
                 current_price = df['close'].iloc[-2]
                 candle_time = df['candle_time'].iloc[-2]
                 
-                # شرط الأمان الزمني: التأكد أن الشمعة التي يتم فحصها حديثة وليست قديمة لتجنب العشوائية
-                now = datetime.now() + timedelta(hours=HOURS_OFFSET)
-                time_diff = (now - candle_time).total_seconds() / 60
+                # مفاتيح التتبع الفريدة لكل عملة وفريم وشمعة
+                state_key_bull = f"{symbol}_{label_tf}_bull"
+                state_key_bear = f"{symbol}_{label_tf}_bear"
+                current_candle_id = str(candle_time)
                 
-                # فريم 15 دقيقة يسمح بفارق بسيط، وفريم الساعة كذلك لضمان عدم تفويت الإغلاق وعدم إرسال قديم
-                max_allowed_delay = 20 if label_tf == "15" else 65
-                
-                if time_diff <= max_allowed_delay:
-                    if h_bull:
+                # فحص الدايفرجنس الصاعد المخفي
+                if h_bull:
+                    # التحقق أن هذه الشمعة بالذات لم يُرسل لها تنبيه صاعد من قبل
+                    if last_alerted_status.get(state_key_bull) != current_candle_id:
                         send_telegram_alert(symbol, label_tf, "Hidden Bullish Divergence", current_price, candle_time)
-                    if h_bear:
+                        last_alerted_status[state_key_bull] = current_candle_id
+                
+                # فحص الدايفرجنس الهابط المخفي
+                if h_bear:
+                    # التحقق أن هذه الشمعة بالذات لم يُرسل لها تنبيه هابط من قبل
+                    if last_alerted_status.get(state_key_bear) != current_candle_id:
                         send_telegram_alert(symbol, label_tf, "Hidden Bearish Divergence", current_price, candle_time)
+                        last_alerted_status[state_key_bear] = current_candle_id
+                
+                time.sleep(0.05)
 
 @app.route("/")
 def home():
-    return "Bot is running with strict anti-duplicate and accurate timing!"
+    return "Bot is running with precise real-time event-driven alerts!"
 
 if __name__ == "__main__":
     scheduler = BackgroundScheduler()
