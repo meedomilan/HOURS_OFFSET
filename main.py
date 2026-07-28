@@ -1,142 +1,97 @@
-import os
-import time
-from datetime import datetime, timedelta
 import requests
+import ccxt
 import pandas as pd
-import numpy as np
-from flask import Flask
-from apscheduler.schedulers.background import BackgroundScheduler
+import ta
+from datetime import datetime
 
-app = Flask(__name__)
+TELEGRAM_TOKEN = "8711875284:AAGGERDv9njI0QZ9Fnrc1_tN9xeVLEXtnCc"  
+TELEGRAM_CHAT_ID = "-1004394911035"
 
-TELEGRAM_TOKEN = "8711875284:AAGGERDv9njI0QZ9Fnrc1_tN9xeVLEXtnCc"
-CHAT_ID = "-1004394911035"
+# ربط بورصة Binance
+exchange = ccxt.binance()
 
-HOURS_OFFSET = 3
+def get_ohlcv(symbol, timeframe):
+    """جلب بيانات الشموع اليابانية"""
+    bars = exchange.fetch_ohlcv(symbol, timeframe, limit=100)
+    df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    df['rsi'] = ta.momentum.RSIIndicator(df['close'], window=14).rsi()
+    return df
 
-# قاموس لتتبع آخر حالة دايفرجنس تم إرسال تنبيه لها لكل عملة وفريم (لمنع الإرسال الجماعي والتكرار)
-last_alerted_status = {}
+def find_pivots(series, left=5, right=5):
+    """تحديد القمم والقيعان"""
+    pivots = []
+    for i in range(left, len(series) - right):
+        is_high = all(series[i] >= series[i-j] for j in range(1, left+1)) and \
+                  all(series[i] >= series[i+j] for j in range(1, right+1))
+        is_low = all(series[i] <= series[i-j] for j in range(1, left+1)) and \
+                  all(series[i] <= series[i+j] for j in range(1, right+1))
+        if is_high:
+            pivots.append((i, 'high', series[i]))
+        elif is_low:
+            pivots.append((i, 'low', series[i]))
+    return pivots
 
-def get_binance_futures_symbols():
-    url = "https://fapi.binance.com/fapi/v1/exchangeInfo"
-    try:
-        response = requests.get(url, timeout=5)
-        data = response.json()
-        symbols = [s['symbol'] for s in data['symbols'] if s['contractType'] == 'PERPETUAL' and s['status'] == 'TRADING']
-        return symbols
-    except Exception as e:
-        print(f"Error fetching symbols: {e}")
-    return []
-
-def get_historical_klines(symbol, interval, limit=50):
-    url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}"
-    try:
-        response = requests.get(url, timeout=5)
-        data = response.json()
-        if isinstance(data, list):
-            df = pd.DataFrame(data, columns=[
-                'timestamp', 'open', 'high', 'low', 'close', 'volume',
-                'close_time', 'quote_asset_volume', 'number_of_trades',
-                'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'
-            ])
-            df['close'] = df['close'].astype(float)
-            df['high'] = df['high'].astype(float)
-            df['low'] = df['low'].astype(float)
-            df['open'] = df['open'].astype(float)
-            df['candle_time'] = pd.to_datetime(df['timestamp'], unit='ms') + timedelta(hours=HOURS_OFFSET)
-            return df
-    except Exception as e:
-        pass
-    return None
-
-def calculate_rsi_and_divergence(df, period=14):
-    delta = df['close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / loss
-    df['rsi'] = 100 - (100 / (1 + rs))
+def detect_hidden_divergence(df):
+    """كشف الانعكاس المخفي"""
+    signals = []
+    price_pivots = find_pivots(df['close'])
+    rsi_pivots = find_pivots(df['rsi'])
     
-    if len(df) < 30:
-        return False, False
-        
-    lows = df['low'].values
-    highs = df['high'].values
-    rsis = df['rsi'].values
+    # مطابقة آخر قمتين أو قاعين
+    highs = [p for p in price_pivots if p[1] == 'high'][-2:]
+    lows = [p for p in price_pivots if p[1] == 'low'][-2:]
     
-    curr_low = lows[-2]
-    prev_low = lows[-15]
-    curr_rsi = rsis[-2]
-    prev_rsi = rsis[-15]
+    if len(highs) == 2:
+        p1, p2 = highs
+        r1 = df['rsi'].iloc[p1[0]]
+        r2 = df['rsi'].iloc[p2[0]]
+        # مخفي صاعد: سعر أعلى، RSI أدنى
+        if p2[2] > p1[2] and r2 < r1:
+            signals.append(('hidden_bullish', p1, p2, r1, r2))
     
-    hidden_bull = (curr_low > prev_low) and (curr_rsi < prev_rsi) and (rsis[-1] > rsis[-2])
+    if len(lows) == 2:
+        p1, p2 = lows
+        r1 = df['rsi'].iloc[p1[0]]
+        r2 = df['rsi'].iloc[p2[0]]
+        # مخفي هابط: سعر أدنى، RSI أعلى
+        if p2[2] < p1[2] and r2 > r1:
+            signals.append(('hidden_bearish', p1, p2, r1, r2))
     
-    curr_high = highs[-2]
-    prev_high = highs[-15]
-    
-    hidden_bear = (curr_high < prev_high) and (curr_rsi > prev_rsi) and (rsis[-1] < rsis[-2])
-    
-    return hidden_bull, hidden_bear
+    return signals
 
-def send_telegram_alert(symbol, interval_str, div_type, price, candle_time):
-    formatted_time = candle_time.strftime('%Y-%m-%d %H:%M:%S')
-
-    text = f"""🚨 تنبيه دايفرجنس جديد
-
-🪙 العملة: {symbol}#
-⏱️ الفريم: {interval_str}
-📊 نوع التنبيه: {div_type}
-💵 السعر الحالي: {price:.4f}
-⏰ الوقت: {formatted_time}"""
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": text}
-    try:
-        requests.post(url, json=payload, timeout=3)
-    except Exception as e:
-        print(f"Telegram error: {e}")
+def send_telegram(message):
+    """إرسال رسالة للتيليجرام"""
+    url = f"[api.telegram.org](https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage)"
+    payload = {'chat_id': TELEGRAM_CHAT_ID, 'text': message, 'parse_mode': 'Markdown'}
+    requests.post(url, json=payload)
 
 def scan_market():
-    symbols = get_binance_futures_symbols()
-    intervals = {"15m": "15", "1h": "60"}
+    """فحص جميع العملات"""
+    tickers = ['BTC/USDT', 'ETH/USDT', 'BNB/USDT', 'SOL/USDT', 'XRP/USDT']
+    timeframes = ['15m', '1h']
     
-    for symbol in symbols:
-        for binance_tf, label_tf in intervals.items():
-            df = get_historical_klines(symbol, binance_tf, limit=40)
-            if df is not None and not df.empty:
-                h_bull, h_bear = calculate_rsi_and_divergence(df)
+    for symbol in tickers:
+        for tf in timeframes:
+            df = get_ohlcv(symbol, tf)
+            signals = detect_hidden_divergence(df)
+            for sig in signals:
+                if sig[0] == 'hidden_bullish':
+                    emoji = '🟢'
+                    title = 'انعكاس مخفي صاعد'
+                else:
+                    emoji = '🔴'
+                    title = 'انعكاس مخفي هابط'
                 
-                current_price = df['close'].iloc[-2]
-                candle_time = df['candle_time'].iloc[-2]
-                
-                # مفاتيح التتبع الفريدة لكل عملة وفريم وشمعة
-                state_key_bull = f"{symbol}_{label_tf}_bull"
-                state_key_bear = f"{symbol}_{label_tf}_bear"
-                current_candle_id = str(candle_time)
-                
-                # فحص الدايفرجنس الصاعد المخفي
-                if h_bull:
-                    # التحقق أن هذه الشمعة بالذات لم يُرسل لها تنبيه صاعد من قبل
-                    if last_alerted_status.get(state_key_bull) != current_candle_id:
-                        send_telegram_alert(symbol, label_tf, "Hidden Bullish Divergence", current_price, candle_time)
-                        last_alerted_status[state_key_bull] = current_candle_id
-                
-                # فحص الدايفرجنس الهابط المخفي
-                if h_bear:
-                    # التحقق أن هذه الشمعة بالذات لم يُرسل لها تنبيه هابط من قبل
-                    if last_alerted_status.get(state_key_bear) != current_candle_id:
-                        send_telegram_alert(symbol, label_tf, "Hidden Bearish Divergence", current_price, candle_time)
-                        last_alerted_status[state_key_bear] = current_candle_id
-                
-                time.sleep(0.05)
-
-@app.route("/")
-def home():
-    return "Bot is running with precise real-time event-driven alerts!"
+                msg = f"""{emoji} *{title}*
+━━━━━━━━━━━━━━━━━━━
+العملة: `{symbol}`
+الفريم: {tf}
+السعر الحالي: ${df['close'].iloc[-1]:.2f}
+الوقت: {datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC
+━━━━━━━━━━━━━━━━━━━
+📊 [TradingView](https://www.tradingview.com/chart/?symbol=BINANCE:{symbol.replace('/', '')})"""
+                send_telegram(msg)
 
 if __name__ == "__main__":
-    scheduler = BackgroundScheduler()
-    scheduler.add_job(func=scan_market, trigger="interval", minutes=1)
-    scheduler.start()
-    
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
+    scan_market()
