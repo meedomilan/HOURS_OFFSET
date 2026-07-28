@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 import requests
 import pandas as pd
 import numpy as np
-from flask import Flask, jsonify
+from flask import Flask
 from apscheduler.schedulers.background import BackgroundScheduler
 
 app = Flask(__name__)
@@ -14,8 +14,8 @@ CHAT_ID = "-1004394911035"
 
 HOURS_OFFSET = 3
 
-# لتخزين وقت آخر تنبيه تم إرساله لكل عملة وفريم لتجنب التكرار والإرسال العشوائي
-sent_alerts = {}
+# قاموس لتسجيل التنبيهات المرسلة سابقاً لمنع التكرار نهائياً
+sent_alerts = set()
 
 def get_binance_futures_symbols():
     url = "https://fapi.binance.com/fapi/v1/exchangeInfo"
@@ -43,6 +43,7 @@ def get_historical_klines(symbol, interval, limit=50):
             df['high'] = df['high'].astype(float)
             df['low'] = df['low'].astype(float)
             df['open'] = df['open'].astype(float)
+            # ضبط توقيت الشمعة بدقة مع فارق الساعات المخصص
             df['candle_time'] = pd.to_datetime(df['timestamp'], unit='ms') + timedelta(hours=HOURS_OFFSET)
             return df
     except Exception as e:
@@ -78,16 +79,16 @@ def calculate_rsi_and_divergence(df, period=14):
     return hidden_bull, hidden_bear
 
 def send_telegram_alert(symbol, interval_str, div_type, price, candle_time):
+    # إنشاء مفتاح فريد لا يتكرر أبداً لهذه الشمعة بالذات
     alert_key = f"{symbol}_{interval_str}_{candle_time}"
     
-    # التأكد من عدم إرسال نفس التنبيه لنفس الشمعة مرتين نهائياً
     if alert_key in sent_alerts:
-        return
+        return  # تم إرسال تنبيه لهذه الشمعة مسبقاً، تجاهل تام لمنع التكرار
     
-    sent_alerts[alert_key] = True
+    sent_alerts.add(alert_key)
     
-    # تنظيف الذاكرة القديمة للحفاظ على أداء السيرفر
-    if len(sent_alerts) > 2000:
+    # تنظيف الذاكرة للحفاظ على خفة السيرفر إذا كثرت المفاتيح
+    if len(sent_alerts) > 3000:
         sent_alerts.clear()
 
     formatted_time = candle_time.strftime('%Y-%m-%d %H:%M:%S')
@@ -116,22 +117,29 @@ def scan_market():
             df = get_historical_klines(symbol, binance_tf, limit=40)
             if df is not None and not df.empty:
                 h_bull, h_bear = calculate_rsi_and_divergence(df)
-                # فحص الشمعة المغلقة بدقة (الإصدار السابق)
+                
                 current_price = df['close'].iloc[-2]
                 candle_time = df['candle_time'].iloc[-2]
                 
-                if h_bull:
-                    send_telegram_alert(symbol, label_tf, "Hidden Bullish Divergence", current_price, candle_time)
-                if h_bear:
-                    send_telegram_alert(symbol, label_tf, "Hidden Bearish Divergence", current_price, candle_time)
+                # شرط الأمان الزمني: التأكد أن الشمعة التي يتم فحصها حديثة وليست قديمة لتجنب العشوائية
+                now = datetime.now() + timedelta(hours=HOURS_OFFSET)
+                time_diff = (now - candle_time).total_seconds() / 60
+                
+                # فريم 15 دقيقة يسمح بفارق بسيط، وفريم الساعة كذلك لضمان عدم تفويت الإغلاق وعدم إرسال قديم
+                max_allowed_delay = 20 if label_tf == "15" else 65
+                
+                if time_diff <= max_allowed_delay:
+                    if h_bull:
+                        send_telegram_alert(symbol, label_tf, "Hidden Bullish Divergence", current_price, candle_time)
+                    if h_bear:
+                        send_telegram_alert(symbol, label_tf, "Hidden Bearish Divergence", current_price, candle_time)
 
 @app.route("/")
 def home():
-    return "Bot is running with precise candle timing!"
+    return "Bot is running with strict anti-duplicate and accurate timing!"
 
 if __name__ == "__main__":
     scheduler = BackgroundScheduler()
-    # فحص دقيق كل دقيقة لتغطية إغلاق فريم 15 دقيقة والساعة في وقتها المحدد
     scheduler.add_job(func=scan_market, trigger="interval", minutes=1)
     scheduler.start()
     
